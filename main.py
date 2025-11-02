@@ -139,11 +139,15 @@ async def main():
     final_df = pd.DataFrame(assignments)
     tsv_content = final_df.to_csv(sep="\t", index=False)
 
-    # === Return TSV as actor output so Make.com can map it ===
-    await Actor.exit(tsv_content)
+    # === Save TSV to Key-Value Store for Make.com ===
+    await Actor.set_value("FINAL_SCHEDULE", tsv_content)
+
+    # === Exit actor ===
+    await Actor.exit()
 
 # Run the async main
 asyncio.run(main())
+
 
 
 
