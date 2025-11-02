@@ -106,7 +106,10 @@ async def main():
                     "Hours": hours,
                 })
 
-        final_df = pd.DataFrame(assignments)
+        # Save the final schedule TSV to Apify's key-value store
         await Actor.set_value("final_schedule.tsv", final_df.to_csv(sep="\t", index=False))
+        # Push structured data to the default dataset (visible in Dataset tab)
         await Actor.push_data(assignments)
         print(f"✅ Generated schedule with {len(assignments)} assignments")
+
+
