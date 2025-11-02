@@ -4,7 +4,7 @@ import random
 from apify import Actor
 import aiohttp
 import asyncio
-import io  # <-- fix for StringIO
+import io
 
 async def main():
     # === Initialize actor ===
@@ -44,7 +44,7 @@ async def main():
             async with session.get(url) as resp:
                 resp.raise_for_status()
                 text = await resp.text()
-                return pd.read_csv(io.StringIO(text), sep="\t")  # <-- fixed here
+                return pd.read_csv(io.StringIO(text), sep="\t")
 
     shifts = await fetch_tsv(setup_shifts_url)
     avail = await fetch_tsv(employee_availability_url)
@@ -139,17 +139,12 @@ async def main():
     final_df = pd.DataFrame(assignments)
     tsv_content = final_df.to_csv(sep="\t", index=False)
 
-    # === Save to Key-Value Store (optional) ===
-    await Actor.set_value("final_schedule.tsv", tsv_content)
-
-    # === Print TSV content so Make.com can capture it ===
-    print(tsv_content)
-
-    # === Exit actor ===
-    await Actor.exit()
+    # === Return TSV as actor output so Make.com can map it ===
+    await Actor.exit(tsv_content)
 
 # Run the async main
 asyncio.run(main())
+
 
 
 
