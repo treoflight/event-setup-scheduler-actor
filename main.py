@@ -6,12 +6,15 @@ import aiohttp
 import asyncio
 
 async def main():
-    # === Input TSV URLs from Apify input JSON ===
+    # === Initialize actor ===
+    await Actor.init()
+
+    # === Get input JSON from Make.com / Apify ===
     input_data = await Actor.get_input()
     setup_shifts_url = input_data.get("setup_shifts_tsv")
     employee_availability_url = input_data.get("employee_availability_tsv")
 
-    # === Shift Capacity Rules ===
+    # === Shift rules ===
     SHIFT_RULES = {
         "Midday": {"min": 3, "max": 5},
         "Night": {"min": 8, "max": 10},
@@ -45,7 +48,7 @@ async def main():
     shifts = await fetch_tsv(setup_shifts_url)
     avail = await fetch_tsv(employee_availability_url)
 
-    # === Clean columns ===
+    # === Clean column names ===
     shifts.columns = [c.strip() for c in shifts.columns]
     avail.columns = [c.strip() for c in avail.columns]
 
@@ -141,10 +144,12 @@ async def main():
     # === Print TSV content so Make.com can capture it ===
     print(tsv_content)
 
+    # === Exit actor ===
     await Actor.exit()
 
-# Run the async main function
+# Run the async main
 asyncio.run(main())
+
 
 
 
