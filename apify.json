@@ -1,0 +1,6 @@
+{
+  "name": "event-scheduler",
+  "version": "0.1",
+  "builds": [{ "cmd": "pip install -r requirements.txt" }],
+  "entrypoint": "python3 main.py"
+}
