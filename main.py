@@ -4,6 +4,7 @@ import random
 from apify import Actor
 import aiohttp
 import asyncio
+import io  # <-- fix for StringIO
 
 async def main():
     # === Initialize actor ===
@@ -43,7 +44,7 @@ async def main():
             async with session.get(url) as resp:
                 resp.raise_for_status()
                 text = await resp.text()
-                return pd.read_csv(pd.compat.StringIO(text), sep="\t")
+                return pd.read_csv(io.StringIO(text), sep="\t")  # <-- fixed here
 
     shifts = await fetch_tsv(setup_shifts_url)
     avail = await fetch_tsv(employee_availability_url)
