@@ -1,154 +1,146 @@
-from apify import Actor
 import pandas as pd
 from datetime import datetime
 import random
-import traceback
+from apify import Actor
 import aiohttp
-import io
 import asyncio
 
-# ------------------------
-# SHIFT RULES
-# ------------------------
+# === Input TSV URLs from Apify input JSON ===
+input_data = await Actor.get_input()  # {"setup_shifts_tsv": "...", "employee_availability_tsv": "..."}
+setup_shifts_url = input_data.get("setup_shifts_tsv")
+employee_availability_url = input_data.get("employee_availability_tsv")
+
+# === Shift Capacity Rules ===
 SHIFT_RULES = {
     "Midday": {"min": 3, "max": 5},
     "Night": {"min": 8, "max": 10},
 }
 
+# === Helper to parse times ===
 def parse_time(t):
-    if pd.isna(t): return None
+    if pd.isna(t):
+        return None
     t = str(t).strip()
-    if not t: return None
+    if not t:
+        return None
     for fmt in ["%I:%M:%S %p", "%I:%M %p", "%I %p", "%H:%M:%S", "%H:%M", "%H:%M:%S.%f"]:
-        try: return datetime.strptime(t, fmt).time()
-        except: pass
-    try: return datetime.fromisoformat(t).time()
-    except: return None
-
-async def main():
-    print("🚀 Actor container started")
+        try:
+            return datetime.strptime(t, fmt).time()
+        except Exception:
+            pass
     try:
-        async with Actor:  # Correct indentation here
-            # --- Get input ---
-            print("📥 Getting input from Apify...")
-            input_data = await Actor.get_input() or {}
-            print(f"Input data received: {input_data}")
+        return datetime.fromisoformat(t).time()
+    except Exception:
+        return None
 
-            shifts_url = input_data.get("setup_shifts_tsv")
-            avail_url = input_data.get("employee_availability_tsv")
+# === Fetch TSVs from URLs ===
+async def fetch_tsv(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            return pd.read_csv(pd.compat.StringIO(text), sep="\t")
 
-            if not shifts_url or not avail_url:
-                msg = "❌ Missing input URLs."
-                print(msg)
-                await Actor.fail(msg)
-                return
+shifts = await fetch_tsv(setup_shifts_url)
+avail = await fetch_tsv(employee_availability_url)
 
-            # --- Load TSVs ---
-            async with aiohttp.ClientSession() as session:
-                print(f"📥 Loading setup shifts from: {shifts_url}")
-                async with session.get(shifts_url) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to load setup_shifts_tsv (status {resp.status})")
-                    shifts_file = await resp.text()
+# === Clean columns ===
+shifts.columns = [c.strip() for c in shifts.columns]
+avail.columns = [c.strip() for c in avail.columns]
 
-                print(f"📥 Loading employee availability from: {avail_url}")
-                async with session.get(avail_url) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to load employee_availability_tsv (status {resp.status})")
-                    avail_file = await resp.text()
+shifts["Shift Start Parsed"] = shifts["Shift Start Time"].apply(parse_time)
+shifts["Shift End Parsed"] = shifts["Shift End Time"].apply(parse_time)
+shifts["Hours"] = pd.to_numeric(shifts["Hours"], errors="coerce").fillna(0.0)
+shifts["Date Parsed"] = pd.to_datetime(shifts["Date"], errors="coerce")
+shifts = shifts.sort_values(["Date Parsed", "Shift Start Parsed"]).reset_index(drop=True)
 
-            shifts = pd.read_csv(io.StringIO(shifts_file), sep="\t")
-            avail = pd.read_csv(io.StringIO(avail_file), sep="\t")
-            print("✅ TSV files loaded successfully.")
+# === Employee availability map ===
+weekday_cols = {
+    "Monday": "Monday Availability",
+    "Tuesday": "Tuesday Availability",
+    "Wednesday": "Wednesday Availability",
+    "Thursday": "Thursday Availability",
+    "Friday": "Friday Availability",
+    "Saturday": "Saturday Availability",
+    "Sunday": "Sunday Availability",
+}
 
-            # --- Rest of scheduling logic (same as before) ---
-            shifts.columns = [c.strip() for c in shifts.columns]
-            avail.columns = [c.strip() for c in avail.columns]
-            shifts["Shift Start Parsed"] = shifts["Shift Start Time"].apply(parse_time)
-            shifts["Shift End Parsed"] = shifts["Shift End Time"].apply(parse_time)
-            shifts["Hours"] = pd.to_numeric(shifts["Hours"], errors="coerce").fillna(0.0)
-            shifts["Date Parsed"] = pd.to_datetime(shifts["Date"], errors="coerce")
-            shifts = shifts.sort_values(["Date Parsed", "Shift Start Parsed"]).reset_index(drop=True)
+employees = {}
+for _, row in avail.iterrows():
+    name = str(row["Name"]).strip()
+    emp_av = {}
+    for wd, col in weekday_cols.items():
+        val = str(row.get(col, "")).strip().lower()
+        if "midday" in val:
+            emp_av[wd] = "Midday"
+        elif "night" in val:
+            emp_av[wd] = "Night"
+        elif "both" in val:
+            emp_av[wd] = "Both"
+        else:
+            emp_av[wd] = ""
+    employees[name] = {"availability": emp_av, "assigned_hours": 0.0, "assignments": []}
 
-            weekday_cols = {
-                "Monday": "Monday Availability",
-                "Tuesday": "Tuesday Availability",
-                "Wednesday": "Wednesday Availability",
-                "Thursday": "Thursday Availability",
-                "Friday": "Friday Availability",
-                "Saturday": "Saturday Availability",
-                "Sunday": "Sunday Availability",
-            }
+# === Scheduling logic ===
+assignments = []
 
-            employees = {}
-            for _, row in avail.iterrows():
-                name = str(row["Name"]).strip()
-                emp_av = {}
-                for wd, col in weekday_cols.items():
-                    val = str(row.get(col, "")).strip().lower()
-                    if "midday" in val: emp_av[wd] = "Midday"
-                    elif "night" in val: emp_av[wd] = "Night"
-                    elif "both" in val: emp_av[wd] = "Both"
-                    else: emp_av[wd] = ""
-                employees[name] = {"availability": emp_av, "assigned_hours": 0.0, "assignments": []}
+for _, shift in shifts.iterrows():
+    date = str(shift["Date"]).strip()
+    weekday = str(shift["Day of the Week"]).strip()
+    shift_type = str(shift["Midday or Night Shift"]).strip().capitalize()
+    start = shift["Shift Start Parsed"]
+    end = shift["Shift End Parsed"]
+    hours = float(shift["Hours"])
 
-            assignments = []
+    rules = SHIFT_RULES.get(shift_type, {"min": 0, "max": 0})
+    min_needed, max_needed = rules["min"], rules["max"]
 
-            for _, shift in shifts.iterrows():
-                date = str(shift["Date"]).strip()
-                weekday = str(shift["Day of the Week"]).strip()
-                shift_type = str(shift["Midday or Night Shift"]).strip().capitalize()
-                start = shift["Shift Start Parsed"]
-                end = shift["Shift End Parsed"]
-                hours = float(shift["Hours"])
-                rules = SHIFT_RULES.get(shift_type, {"min": 0, "max": 0})
-                min_needed, max_needed = rules["min"], rules["max"]
+    # Find available employees
+    candidates = []
+    for name, info in employees.items():
+        av = info["availability"].get(weekday, "")
+        if av in ("Both", shift_type):
+            candidates.append((name, info["assigned_hours"]))
 
-                candidates = [(n, info["assigned_hours"]) for n, info in employees.items()
-                              if info["availability"].get(weekday, "") in ("Both", shift_type)]
-                candidates.sort(key=lambda x: x[1])
-                random.shuffle(candidates)
+    # Sort by hours and shuffle ties
+    candidates.sort(key=lambda x: x[1])
+    random.shuffle(candidates)
 
-                if len(candidates) < min_needed:
-                    chosen = [c[0] for c in candidates]
-                    extras_needed = min_needed - len(chosen)
-                    other = [(n, info["assigned_hours"]) for n, info in employees.items() if n not in chosen]
-                    other.sort(key=lambda x: x[1])
-                    chosen.extend([c[0] for c in other[:extras_needed]])
-                else:
-                    chosen = [c[0] for c in candidates[:max_needed]]
+    # Ensure minimum staffing
+    if len(candidates) < min_needed:
+        chosen = [c[0] for c in candidates]
+        extras_needed = min_needed - len(chosen)
+        other_emps = [(n, info["assigned_hours"]) for n, info in employees.items() if n not in chosen]
+        other_emps.sort(key=lambda x: x[1])
+        chosen.extend([c[0] for c in other_emps[:extras_needed]])
+    else:
+        chosen = [c[0] for c in candidates[:max_needed]]
 
-                for emp_name in chosen:
-                    employees[emp_name]["assigned_hours"] += hours
-                    employees[emp_name]["assignments"].append((date, start, end))
-                    assignments.append({
-                        "Date": date,
-                        "Day of the Week": weekday,
-                        "Midday or Night Shift": shift_type,
-                        "Shift Start Time": shift["Shift Start Time"],
-                        "Shift End Time": shift["Shift End Time"],
-                        "Employee Name": emp_name,
-                        "Hours": hours,
-                    })
+    # Assign employees
+    for emp_name in chosen:
+        employees[emp_name]["assigned_hours"] += hours
+        employees[emp_name]["assignments"].append((date, start, end))
+        assignments.append({
+            "Date": date,
+            "Day of the Week": weekday,
+            "Midday or Night Shift": shift_type,
+            "Shift Start Time": shift["Shift Start Time"],
+            "Shift End Time": shift["Shift End Time"],
+            "Employee Name": emp_name,
+            "Hours": hours,
+        })
 
-            final_df = pd.DataFrame(assignments)
-            print(f"✅ Generated {len(assignments)} total shift assignments.")
+# === Convert to DataFrame and TSV string ===
+final_df = pd.DataFrame(assignments)
+tsv_content = final_df.to_csv(sep="\t", index=False)
 
-            await Actor.set_value("final_schedule.tsv", final_df.to_csv(sep="\t", index=False))
-            print("💾 Saved final_schedule.tsv to Key-Value Store.")
-            await Actor.push_data(assignments)
-            print("📤 Pushed assignments to Dataset.")
+# === Save to Key-Value Store (optional) ===
+await Actor.set_value("final_schedule.tsv", tsv_content)
 
-            print("🎉 Scheduling completed successfully!")
+# === Print TSV content so Make.com can capture it ===
+print(tsv_content)
 
-    except Exception as e:
-        print("❌ ERROR OCCURRED:")
-        print(traceback.format_exc())
-        await Actor.fail(f"Error during scheduling: {str(e)}")
-
-# Run the actor
-if __name__ == "__main__":
-    asyncio.run(main())
+await Actor.exit()
 
 
 
